@@ -34,6 +34,39 @@
 #include "flash.h"
 #include "storage.h"
 
+#if defined(STM32H7)
+// Safe Flash read: suppress BusFault from ECC errors during memcpy.
+// Returns 0 on success, -1 on ECC error (dest filled with 0xFF).
+static int flash_safe_memcpy(void *dest, const volatile void *src, size_t len) {
+    // Mask BusFault: set FAULTMASK and ignore BusFault in HardFault/NMI
+    __set_FAULTMASK(1);
+    SCB->CCR |= SCB_CCR_BFHFNMIGN_Msk;
+    __DSB();
+    __ISB();
+
+    memcpy(dest, (const void *)src, len);
+
+    // Restore fault handling
+    SCB->CCR &= ~SCB_CCR_BFHFNMIGN_Msk;
+    __set_FAULTMASK(0);
+    __DSB();
+    __ISB();
+
+    // Check both banks for ECC errors
+    uint32_t sr1 = FLASH->SR1;
+    uint32_t sr2 = FLASH->SR2;
+    if ((sr1 | sr2) & (FLASH_SR_DBECCERR | FLASH_SR_SNECCERR)) {
+        // Clear ECC error flags
+        FLASH->CCR1 = FLASH_CCR_CLR_DBECCERR | FLASH_CCR_CLR_SNECCERR;
+        FLASH->CCR2 = FLASH_CCR_CLR_DBECCERR | FLASH_CCR_CLR_SNECCERR;
+        // Return erased-flash pattern so LittleFS CRC detects corruption
+        memset(dest, 0xff, len);
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 #if MICROPY_HW_ENABLE_INTERNAL_FLASH_STORAGE
 
 // The linker script specifies flash storage and RAM cache locations.
@@ -115,7 +148,16 @@ static uint8_t *flash_cache_get_addr_for_write(uint32_t flash_addr) {
     }
     if (flash_cache_sector_start != flash_sector_start) {
         flash_bdev_ioctl(BDEV_IOCTL_SYNC, 0);
+        #if defined(STM32H7)
+        if (flash_safe_memcpy((void *)CACHE_MEM_START_ADDR,
+                              (const void *)flash_sector_start,
+                              flash_sector_size) != 0) {
+            // ECC error — cache filled with 0xFF (erased pattern)
+            // LittleFS will detect CRC mismatch on this sector
+        }
+        #else
         memcpy((void *)CACHE_MEM_START_ADDR, (const void *)flash_sector_start, flash_sector_size);
+        #endif
         flash_cache_sector_start = flash_sector_start;
         flash_cache_sector_size = flash_sector_size;
     }
@@ -184,6 +226,12 @@ bool flash_bdev_readblock(uint8_t *dest, uint32_t block) {
         return false;
     }
     uint8_t *src = flash_cache_get_addr_for_read(flash_addr);
+    #if defined(STM32H7)
+    if (src == (uint8_t *)flash_addr) {
+        // Reading directly from Flash (cache miss) — protect against ECC errors
+        return flash_safe_memcpy(dest, src, FLASH_BLOCK_SIZE) == 0;
+    }
+    #endif
     memcpy(dest, src, FLASH_BLOCK_SIZE);
     return true;
 }
@@ -212,7 +260,16 @@ int flash_bdev_readblocks_ext(uint8_t *dest, uint32_t block, uint32_t offset, ui
             return -1;
         }
         uint8_t *src = flash_cache_get_addr_for_read(flash_addr + offset);
-        memcpy(dest, src, l);
+        #if defined(STM32H7)
+        if (src == (uint8_t *)(flash_addr + offset)) {
+            if (flash_safe_memcpy(dest, src, l) != 0) {
+                return -1;
+            }
+        } else
+        #endif
+        {
+            memcpy(dest, src, l);
+        }
         dest += l;
         block += 1;
         offset = 0;
