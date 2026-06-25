@@ -57,7 +57,7 @@ extern uint32_t rng_get(void);
 #define TCP_SND_BUF (4 * TCP_MSS)
 #endif
 
-#if 1
+#if 0
 // lwip takes 26700 bytes; TCP dl/ul are around 750/600 k/s on local network
 #define MEM_SIZE (8000)
 #define TCP_MSS (800)
@@ -66,7 +66,10 @@ extern uint32_t rng_get(void);
 #define MEMP_NUM_TCP_SEG (32)
 #endif
 
-#if 0
+// [C1] 2026-06 内存碎片化加固: lwIP 8K 堆稳态撞 96.5%(7716/8000), 离 OOM 仅 284B
+// (debugger 30min soak n=4370 实证, task:update_variables 瞬时 +7056 lwIP_alloc 会撞顶).
+// 启用 16K 档: 稳态占用降至 ~48%, 给 trap 瞬时分配留余量. 代价 -19K Python GC 堆 (H743 1MB RAM 可承受).
+#if 1
 // lwip takes 45600 bytes; TCP dl/ul are around 1200/1000 k/s on local network
 #define MEM_SIZE (16000)
 #define TCP_MSS (1460)
