@@ -57,19 +57,21 @@ extern uint32_t rng_get(void);
 #define TCP_SND_BUF (4 * TCP_MSS)
 #endif
 
-#if 0
-// lwip takes 26700 bytes; TCP dl/ul are around 750/600 k/s on local network
-#define MEM_SIZE (8000)
+// [C1] lwIP 堆扩容: 仅 MEM_SIZE 8000→16000 (稳态 96.5%→~71%, trap 瞬时 +7K 留余量).
+// TCP_MSS 维持 800 — 不可改 1460: H7 + 高并发下 chained pbuf send 撞 lwIP, socket 进
+// error state, MicroWebSrv 写 header 第二段报 [Errno 5] EIO → HTTP 200 后 RST/body 0 字节.
+// debugger bisect 实证 (T-MUCUMREL 2026-06-26): MEM16K+MSS800 → HTTP 10/10 OK, EIO 0.
+#if 1
+#define MEM_SIZE (16000)
 #define TCP_MSS (800)
 #define TCP_WND (8 * TCP_MSS)
 #define TCP_SND_BUF (8 * TCP_MSS)
 #define MEMP_NUM_TCP_SEG (32)
 #endif
 
-// [C1] 2026-06 内存碎片化加固: lwIP 8K 堆稳态撞 96.5%(7716/8000), 离 OOM 仅 284B
-// (debugger 30min soak n=4370 实证, task:update_variables 瞬时 +7056 lwIP_alloc 会撞顶).
-// 启用 16K 档: 稳态占用降至 ~48%, 给 trap 瞬时分配留余量. 代价 -19K Python GC 堆 (H743 1MB RAM 可承受).
-#if 1
+// ⚠️ 勿启用: MSS 1460 在 H7 高并发下炸 HTTP (见上). 若日后要 1460 提带宽,
+// 须先治 micropython STM32 port 的 lwIP chained pbuf send 路径并发安全.
+#if 0
 // lwip takes 45600 bytes; TCP dl/ul are around 1200/1000 k/s on local network
 #define MEM_SIZE (16000)
 #define TCP_MSS (1460)
