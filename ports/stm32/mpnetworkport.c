@@ -36,6 +36,10 @@
 #include "pendsv.h"
 #include "extmod/modnetwork.h"
 
+#if defined(MICROPY_HW_ETH_MDC)
+#include "eth.h"
+#endif
+
 #if MICROPY_PY_LWIP
 #include "lwip/netif.h"
 #include "lwip/timeouts.h"
@@ -72,6 +76,12 @@ static void pyb_lwip_poll(void) {
 
     // Run the lwIP internal updates
     sys_check_timeouts();
+
+    #if defined(MICROPY_HW_ETH_MDC)
+    // FIELD-019: poll the Ethernet PHY link bit so cable flaps / subnet moves drive
+    // netif link state + a fresh DHCP DISCOVER (throttled to ~1Hz inside).
+    eth_link_poll(&eth_instance);
+    #endif
 
     #if LWIP_NETIF_LOOPBACK
     netif_poll_all();

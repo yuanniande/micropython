@@ -27,6 +27,7 @@
 #include <string.h>
 #include "py/mphal.h"
 #include "py/mperrno.h"
+#include "py/mpprint.h"
 #include "shared/netutils/netutils.h"
 #include "pin_static_af.h"
 #include "extmod/modnetwork.h"
@@ -119,6 +120,10 @@ typedef struct _eth_t {
     struct dhcp dhcp_struct;
     uint32_t phy_addr;
     int16_t (*phy_get_link_status)(uint32_t phy_addr);
+    // FIELD-019: runtime PHY link monitor state (driven ~1Hz from pyb_lwip_poll).
+    bool link_monitor_up;         // debounced link state currently reflected in netif
+    uint8_t link_pending_cnt;     // consecutive opposite-state samples awaiting commit
+    uint32_t link_last_check_ms;  // last time the PHY link bit was polled
 } eth_t;
 
 static eth_dma_t eth_dma __attribute__((aligned(16384)));
@@ -797,6 +802,16 @@ static void eth_lwip_init(eth_t *self) {
 
     netif_set_link_up(n);
 
+    // FIELD-019: seed the runtime link monitor with the just-latched link-up state.
+    self->link_monitor_up = true;
+    self->link_pending_cnt = 0;
+    self->link_last_check_ms = mp_hal_ticks_ms();
+
+    // Boot banner: print the lwIP netif MAC once, so a mismatch vs the wire/ARP MAC
+    // is visible without SWD (debugger 2026-07-03 hwaddr mismatch investigation).
+    mp_printf(&mp_plat_print, "[INFO][NETIF] MAC %02x:%02x:%02x:%02x:%02x:%02x (netif=eth0)\n",
+        n->hwaddr[0], n->hwaddr[1], n->hwaddr[2], n->hwaddr[3], n->hwaddr[4], n->hwaddr[5]);
+
     MICROPY_PY_LWIP_EXIT
 }
 
@@ -846,6 +861,73 @@ int eth_link_status(eth_t *self) {
         } else {
             return 0; // link down
         }
+    }
+}
+
+// FIELD-019: runtime PHY link monitor. Called ~every 128ms from pyb_lwip_poll().
+// eth_lwip_init() latched netif LINK_UP once at boot and nothing polled the PHY at
+// runtime, so a physical cable flap (unplug, or move to another subnet and back) was
+// invisible to lwIP: netif kept LINK_UP + a stale DHCP BOUND lease, and the device
+// only self-healed after the DHCP T1 renew timer (~30 min, FIELD-019 field report).
+// Here we poll the PHY link bit at ~1Hz, debounce a couple of samples to ride out
+// auto-negotiation bounce, and on a real edge drive the netif link state and force a
+// fresh DHCP DISCOVER so recovery is immediate instead of waiting for T1.
+#define ETH_LINK_POLL_INTERVAL_MS (1000)
+#define ETH_LINK_DEBOUNCE_SAMPLES (2)
+
+void eth_link_poll(eth_t *self) {
+    struct netif *n = &self->netif;
+
+    // Only monitor once the interface is administratively up (lwIP initialised).
+    if (!(n->flags & NETIF_FLAG_UP)) {
+        return;
+    }
+
+    uint32_t now = mp_hal_ticks_ms();
+    if (now - self->link_last_check_ms < ETH_LINK_POLL_INTERVAL_MS) {
+        return;
+    }
+    self->link_last_check_ms = now;
+
+    // PHY_BSR link status is latch-low; read twice so we observe the *current* state
+    // (a brief flap latches low; we want the settled level, not the transient).
+    eth_phy_read(self->phy_addr, PHY_BSR);
+    bool phy_up = (eth_phy_read(self->phy_addr, PHY_BSR) & PHY_BSR_LINK_STATUS) != 0;
+
+    if (phy_up == self->link_monitor_up) {
+        self->link_pending_cnt = 0; // steady state, no edge in flight
+        return;
+    }
+
+    // State differs from what netif reflects; require N consecutive samples to commit.
+    if (++self->link_pending_cnt < ETH_LINK_DEBOUNCE_SAMPLES) {
+        return;
+    }
+    self->link_pending_cnt = 0;
+    self->link_monitor_up = phy_up;
+
+    // Runs in the PENDSV_DISPATCH_LWIP context (same as sys_check_timeouts above), which
+    // already serialises against thread-context lwIP access, so no MICROPY_PY_LWIP_ENTER.
+    if (phy_up) {
+        // Link-up edge: bring netif link up and start a fresh DHCP DISCOVER. An up-edge
+        // only ever follows a committed down-edge, which already released the lease and
+        // cleared the address, so dhcp is OFF here and dhcp_start() goes straight to
+        // INIT -> DISCOVER. We deliberately do NOT use netif_set_link_up()'s built-in
+        // dhcp reboot (it would REQUEST the stale lease and can hang if the new subnet's
+        // server stays silent instead of NAKing).
+        mp_printf(&mp_plat_print, "[INFO][NETIF] link up (netif=eth0)\n");
+        netif_set_link_up(n);
+        dhcp_start(n);
+    } else {
+        // Link-down edge: drop the netif link and release the now-invalid lease so
+        // isconnected()/status() report down and the cached IP is cleared; the app
+        // layer (OLED state, outbound-socket cleanup) reacts to the netif status change.
+        mp_printf(&mp_plat_print, "[INFO][NETIF] link down (netif=eth0)\n");
+        dhcp_release_and_stop(n);
+        ip4_addr_t any;
+        ip4_addr_set_zero(&any);
+        netif_set_addr(n, &any, &any, &any);
+        netif_set_link_down(n);
     }
 }
 
